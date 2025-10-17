@@ -60,7 +60,7 @@ if st.button("Predict Price"):
                 )
                 
                 st.write(f"Status Code: {response.status_code}")  # Debug info
-                st.write(f"Response: {response.text}")  # Debug info
+                # st.write(f"Response: {response.text}")  # Debug info
                 
                 if response.status_code == 200:
                     result = response.json()

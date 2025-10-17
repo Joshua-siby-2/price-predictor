@@ -8,12 +8,12 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from peft import PeftModel
 import logging
 
-# Configure logging
+# Configure logging with UTF-8 encoding to handle any characters
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s",
     handlers=[
-        logging.FileHandler("predict.log"),
+        logging.FileHandler("predict.log", encoding='utf-8'),
         logging.StreamHandler()
     ]
 )
@@ -37,8 +37,8 @@ def load_model():
         logging.info("Model already loaded, using cached version.")
         return _model, _tokenizer
     
-    model_path = os.path.join(os.path.dirname(__file__), '..', 'product-price-predictor')
-    base_model_name = "distilgpt2"
+    model_path = os.path.join(os.path.dirname(__file__), '..', 'models', 'product-price-predictor')
+    base_model_name = "gpt2"  # CRITICAL: Must match training script
     
     logging.info("Loading model...")
     
@@ -47,7 +47,7 @@ def load_model():
     base_model = AutoModelForCausalLM.from_pretrained(
         base_model_name,
         device_map="auto" if torch.cuda.is_available() else None,
-        dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
+        torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
     )
     
     # Load PEFT adapter with error handling
@@ -103,7 +103,7 @@ async def predict(product: Product):
     logging.info(f"Product Name: {product.name}")
     logging.info(f"Product Description: {product.description}")
 
-    model_path = os.path.join(os.path.dirname(__file__), '..', 'product-price-predictor')
+    model_path = os.path.join(os.path.dirname(__file__), '..', 'models', 'product-price-predictor')
    
     # Check if model exists
     if not os.path.exists(model_path):
@@ -114,34 +114,36 @@ async def predict(product: Product):
         # Load model (cached)
         model, tokenizer = load_model()
         
-        # Create the prompt matching training format
+        # CRITICAL FIX: Match the exact training format - NO $ SIGN
         prompt = f"""Product: {product.name}
 Description: {product.description}
-Price: $"""
+Price: """
         
         logging.info(f"Generated prompt:\n{prompt}")
        
         # Tokenize the prompt
         logging.info("Tokenizing prompt...")
-        inputs = tokenizer(prompt, return_tensors="pt", padding=True, truncation=True, max_length=256)
+        inputs = tokenizer(prompt, return_tensors="pt", padding=False, truncation=True, max_length=128)
         
         # Move inputs to same device as model
         if torch.cuda.is_available():
             logging.info("Moving inputs to CUDA device.")
             inputs = {k: v.cuda() for k, v in inputs.items()}
         
-        # Generate the prediction
+        # CRITICAL FIX: Better generation parameters
         logging.info("Generating prediction...")
         with torch.no_grad():
             outputs = model.generate(
                 **inputs, 
-                max_new_tokens=10,
+                max_new_tokens=10,  # Short output - just need a number
                 min_new_tokens=1,
                 num_return_sequences=1,
-                temperature=0.1,
-                do_sample=False,
+                temperature=0.7,  # Slightly higher for better diversity
+                do_sample=True,  # Enable sampling
+                top_p=0.9,  # Nucleus sampling
                 pad_token_id=tokenizer.eos_token_id,
                 eos_token_id=tokenizer.eos_token_id,
+                repetition_penalty=1.2,  # CRITICAL: Prevent repetition
             )
         
         # Decode the generated text
@@ -168,7 +170,7 @@ Price: $"""
             response = {
                 "error": "Could not extract a valid price from the model's response.",
                 "model_response": generated_part,
-                "suggestion": "The model needs more training data. Current dataset might be too small (needs 100+ samples)."
+                "suggestion": "The model needs more training or better data. Try retraining with clearer patterns."
             }
             logging.warning(f"Could not extract price. Sending error response: {response}")
             return response
@@ -183,49 +185,47 @@ Price: $"""
         }
 
 def extract_price(text):
-    """Improved price extraction with better pattern matching"""
+    """Extract price from generated text - SIMPLIFIED for number-only format"""
     logging.info(f"Extracting price from: '{text}'")
     
     # Clean the text first
     text = text.strip()
     
-    # Pattern 1: Look for dollar amounts with decimals (most reliable)
-    dollar_pattern = r'\$?\s*(\d{1,3}(?:,\d{3})*\.\d{2})'
-    matches = re.findall(dollar_pattern, text)
+    # Take only the first line to avoid parsing unwanted text
+    first_line = text.split('\n')[0].strip()
+    
+    # Pattern 1: Direct number at the start (MOST COMMON with no $ sign)
+    direct_pattern = r'^(\d+)'
+    match = re.match(direct_pattern, first_line)
+    if match:
+        try:
+            value = int(match.group(1))
+            if 50 <= value <= 10000:  # Reasonable price range
+                logging.info(f"Valid price found via direct pattern: {value}")
+                return str(value)
+        except ValueError:
+            pass
+    
+    # Pattern 2: Number with optional decimal
+    number_pattern = r'(\d+(?:\.\d{1,2})?)'
+    matches = re.findall(number_pattern, first_line)
     
     if matches:
-        clean_price = matches[0].replace(',', '')
-        value = float(clean_price)
-        logging.info(f"Valid price found via decimal pattern: {value}")
-        return str(value)
+        for match in matches:
+            try:
+                value = float(match)
+                if 50 <= value <= 10000:
+                    logging.info(f"Valid price found: {value}")
+                    return str(int(value))
+            except ValueError:
+                continue
     
-    # Pattern 2: Look for dollar amounts without decimals
-    dollar_pattern_simple = r'\$?\s*(\d{1,5})'
-    matches = re.findall(dollar_pattern_simple, text)
-    
-    # Filter reasonable prices and take the most likely one
-    reasonable_prices = []
-    for match in matches:
-        try:
-            value = int(match)
-            # Reasonable price range for consumer products
-            if 50 <= value <= 5000:
-                reasonable_prices.append(value)
-        except ValueError:
-            continue
-    
-    if reasonable_prices:
-        # Take the smallest reasonable price (often the correct one)
-        price = min(reasonable_prices)
-        logging.info(f"Valid price found via integer pattern: {price}")
-        return str(price)
-    
-    # Pattern 3: Extract numbers and filter
-    all_numbers = re.findall(r'\d+', text)
-    for num in all_numbers:
+    # Pattern 3: Any sequence of digits
+    numbers = re.findall(r'\d+', first_line)
+    for num in numbers:
         try:
             value = int(num)
-            if 50 <= value <= 5000:
+            if 50 <= value <= 10000:
                 logging.info(f"Valid price found via fallback: {value}")
                 return str(value)
         except ValueError:
